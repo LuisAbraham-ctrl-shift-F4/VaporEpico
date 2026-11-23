@@ -258,10 +258,10 @@
   </div>
 
   <!-- SYSTEM TOASTS (Top-Right, separated from Steam Presence) -->
-  <div id="toastContainer" class="fixed top-20 right-5 z-50 flex flex-col gap-2 pointer-events-none max-w-sm"></div>
+  <div id="toastContainer" class="fixed top-20 right-5 z-[70] flex flex-col gap-2 pointer-events-none max-w-sm"></div>
 
   <!-- STEAM-STYLE FRIEND PRESENCE NOTIFICATION SLOT (Bottom-Right, Single Coalesced Card!) -->
-  <div id="steamPresenceSlot" class="fixed bottom-5 right-5 z-50 pointer-events-none max-w-sm w-[calc(100vw-2.5rem)]"></div>
+  <div id="steamPresenceSlot" class="fixed bottom-5 right-5 z-[70] pointer-events-none max-w-sm w-[calc(100vw-2.5rem)]"></div>
 
   <script>
     // =========================================================================
@@ -627,7 +627,11 @@
     const STORAGE_KEY = 'vaporepico_accounts_v3';
     const TAB_SESSION_KEY = 'vaporepico_tab_session_v3';
     const REMEMBERED_KEY = 'vaporepico_remembered_v3';
+    const DEVICE_ACCOUNTS_KEY = 'vaporepico_device_accounts_v3';
     const PRESENCE_EVENT_KEY = 'vaporepico_presence_event_v3';
+    const liveChannel = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('vaporepico_live_v3') : null;
+    const seenPresenceEventIds = new Set();
+    let lastLocalStorageSnapshot = '';
 
     function buildDefaultAccounts() {
       return {};
@@ -662,19 +666,53 @@
         try {
           const reviewsByGame = {};
           GAMES.forEach(g => { reviewsByGame[g.id] = g.reviews; });
-          localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          const serialized = JSON.stringify({
             accounts: state.accounts,
             reviewsByGame,
             updatedAt: Date.now()
-          }));
+          });
+          localStorage.setItem(STORAGE_KEY, serialized);
+          lastLocalStorageSnapshot = serialized;
+          this.broadcastSync();
+        } catch (e) {}
+      },
+      getDeviceAccountIds() {
+        try {
+          const raw = localStorage.getItem(DEVICE_ACCOUNTS_KEY);
+          const list = raw ? JSON.parse(raw) : [];
+          return Array.isArray(list) ? list.filter(id => Boolean(state.accounts[id])) : [];
+        } catch (e) {
+          return [];
+        }
+      },
+      addDeviceAccount(accountId) {
+        try {
+          const list = this.getDeviceAccountIds();
+          if (!list.includes(accountId)) {
+            list.unshift(accountId);
+            localStorage.setItem(DEVICE_ACCOUNTS_KEY, JSON.stringify(list));
+          }
+        } catch (e) {}
+      },
+      removeDeviceAccount(accountId) {
+        try {
+          const list = this.getDeviceAccountIds().filter(id => id !== accountId);
+          localStorage.setItem(DEVICE_ACCOUNTS_KEY, JSON.stringify(list));
+          if (localStorage.getItem(REMEMBERED_KEY) === accountId) {
+            localStorage.removeItem(REMEMBERED_KEY);
+          }
         } catch (e) {}
       },
       setTabSession(accountId, remember = true) {
         try {
           if (accountId) {
             sessionStorage.setItem(TAB_SESSION_KEY, accountId);
-            if (remember) localStorage.setItem(REMEMBERED_KEY, accountId);
-            else localStorage.removeItem(REMEMBERED_KEY);
+            if (remember) {
+              localStorage.setItem(REMEMBERED_KEY, accountId);
+              this.addDeviceAccount(accountId);
+            } else {
+              localStorage.removeItem(REMEMBERED_KEY);
+            }
           } else {
             sessionStorage.removeItem(TAB_SESSION_KEY);
             localStorage.removeItem(REMEMBERED_KEY);
@@ -693,14 +731,23 @@
         } catch (e) {}
         return null;
       },
-      broadcastPresence(fromId, gameId) {
+      broadcastPresence(fromId, gameId, eventId) {
+        const payload = {
+          eventId: eventId || (Date.now() + '-' + Math.random().toString(36).slice(2, 7)),
+          fromId,
+          gameId,
+          ts: Date.now()
+        };
         try {
-          localStorage.setItem(PRESENCE_EVENT_KEY, JSON.stringify({
-            eventId: Date.now() + '-' + Math.random().toString(36).slice(2, 7),
-            fromId,
-            gameId,
-            ts: Date.now()
-          }));
+          localStorage.setItem(PRESENCE_EVENT_KEY, JSON.stringify(payload));
+        } catch (e) {}
+        try {
+          if (liveChannel) liveChannel.postMessage({ type: 'presence', payload });
+        } catch (e) {}
+      },
+      broadcastSync() {
+        try {
+          if (liveChannel) liveChannel.postMessage({ type: 'sync', ts: Date.now() });
         } catch (e) {}
       },
       load() {
@@ -774,7 +821,7 @@
 
     function renderAuthGate() {
       const container = document.getElementById('authGateContent');
-      const allAccounts = Object.values(state.accounts);
+      const allAccounts = AuthService.getDeviceAccountIds().map(id => state.accounts[id]).filter(Boolean);
 
       const savedAccountsHtml = allAccounts.length === 0
         ? `
@@ -784,7 +831,7 @@
             </div>
             <div class="space-y-1">
               <p class="text-sm font-bold text-white">Sin cuentas guardadas todavía</p>
-              <p class="text-xs text-slate-400 leading-relaxed">Cuando crees una cuenta nueva aparecerá aquí para que puedas entrar o cambiar de usuario rápidamente.</p>
+              <p class="text-xs text-slate-400 leading-relaxed">Solo aparecerán aquí las cuentas en las que tú inicies sesión en este equipo con "Recordarme" activado.</p>
             </div>
             <button type="button" id="emptyCreateFirstBtn" class="px-4 py-2 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/40 text-cyan-300 text-xs font-bold transition">
               Crear mi primera cuenta →
@@ -796,19 +843,24 @@
             ${allAccounts.map(acc => {
               const g = acc.playingGameId ? getGameById(acc.playingGameId) : null;
               return `
-                <button type="button" data-quick-login="${acc.id}" class="w-full p-3 rounded-xl bg-nexus-surface/80 hover:bg-nexus-hover border border-nexus-border hover:border-cyan-400/60 flex items-center gap-3 text-left transition group">
-                  <div class="relative shrink-0">
-                    <div class="w-10 h-10 rounded-xl overflow-hidden bg-gradient-to-tr ${acc.avatarColor} ${getFrameClass(acc.avatarFrame)} flex items-center justify-center text-xs font-black text-white">${renderAvatarContent(acc)}</div>
-                    <span class="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full ${g ? 'bg-emerald-400' : 'bg-cyan-400'} ring-2 ring-nexus-surface"></span>
-                  </div>
-                  <div class="min-w-0 flex-1">
-                    <p class="text-sm font-bold text-white group-hover:text-cyan-400 transition truncate">${acc.username} <span class="text-xs text-slate-500 font-normal">${acc.tag}</span></p>
-                    <p class="text-[11px] ${g ? 'text-emerald-400 font-semibold' : 'text-slate-400'} truncate">
-                      ${g ? `🎮 Jugando: ${g.title}` : `${Object.keys(acc.library).length} juegos · ${acc.friends.length} amigos · ${formatWallet(acc.walletBalance)}`}
-                    </p>
-                  </div>
-                  <i data-lucide="arrow-right" class="w-4 h-4 text-slate-500 group-hover:text-cyan-400 transition shrink-0"></i>
-                </button>
+                <div class="relative flex items-center gap-1.5">
+                  <button type="button" data-quick-login="${acc.id}" class="flex-1 min-w-0 p-3 rounded-xl bg-nexus-surface/80 hover:bg-nexus-hover border border-nexus-border hover:border-cyan-400/60 flex items-center gap-3 text-left transition group">
+                    <div class="relative shrink-0">
+                      <div class="w-10 h-10 rounded-xl overflow-hidden bg-gradient-to-tr ${acc.avatarColor} ${getFrameClass(acc.avatarFrame)} flex items-center justify-center text-xs font-black text-white">${renderAvatarContent(acc)}</div>
+                      <span class="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full ${g ? 'bg-emerald-400' : 'bg-cyan-400'} ring-2 ring-nexus-surface"></span>
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <p class="text-sm font-bold text-white group-hover:text-cyan-400 transition truncate">${acc.username} <span class="text-xs text-slate-500 font-normal">${acc.tag}</span></p>
+                      <p class="text-[11px] ${g ? 'text-emerald-400 font-semibold' : 'text-slate-400'} truncate">
+                        ${g ? `🎮 Jugando: ${g.title}` : `${Object.keys(acc.library).length} juegos · ${acc.friends.length} amigos`}
+                      </p>
+                    </div>
+                    <i data-lucide="arrow-right" class="w-4 h-4 text-slate-500 group-hover:text-cyan-400 transition shrink-0"></i>
+                  </button>
+                  <button type="button" data-forget-device="${acc.id}" title="Quitar acceso rápido de este equipo" aria-label="Quitar de este equipo" class="p-2.5 rounded-xl bg-nexus-surface/60 hover:bg-rose-500/20 border border-nexus-border text-slate-500 hover:text-rose-400 transition shrink-0">
+                    <i data-lucide="x" class="w-4 h-4"></i>
+                  </button>
+                </div>
               `;
             }).join('')}
           </div>
@@ -881,6 +933,9 @@
                 `).join('')}
               </div>
             </div>
+            <label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
+              <input id="regRememberCheckbox" type="checkbox" class="accent-emerald-400 rounded" /> Recordar esta cuenta en este equipo
+            </label>
             <p id="regErrorMsg" class="hidden text-xs font-semibold text-rose-400 bg-rose-500/10 border border-rose-500/30 rounded-xl px-3 py-2"></p>
             <button type="submit" class="w-full py-3.5 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-400 hover:brightness-110 text-slate-950 font-black text-sm shadow-lg shadow-emerald-500/20 transition">
               Crear Cuenta Nueva
@@ -980,6 +1035,14 @@
         });
       });
 
+      container.querySelectorAll('[data-forget-device]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          AuthService.removeDeviceAccount(btn.dataset.forgetDevice);
+          renderAuthGate();
+          showToast('Cuenta quitada de los accesos rápidos de este equipo.', 'info');
+        });
+      });
+
       // Update avatar color WITHOUT re-rendering the form (keeps all typed inputs intact!)
       container.querySelectorAll('[data-auth-grad]').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -1027,11 +1090,13 @@
             errEl.classList.remove('hidden');
             return;
           }
+          const regRem = document.getElementById('regRememberCheckbox');
           const created = createAccount({
             username: document.getElementById('regUsername').value,
             email: document.getElementById('regEmail').value,
             password: pwd,
-            avatarColor: state.authChosenGrad
+            avatarColor: state.authChosenGrad,
+            remember: regRem ? regRem.checked : false
           });
           if (created) hideAuthGate();
         });
@@ -1389,7 +1454,7 @@
       }
     }
 
-    function createAccount({ username, email, password, avatarColor }) {
+    function createAccount({ username, email, password, avatarColor, remember = false }) {
       const clean = username.trim().replace(/\s+/g, '_');
       if (clean.length < 3) {
         showToast('El nombre de usuario debe tener al menos 3 caracteres.', 'warning');
@@ -1434,14 +1499,16 @@
         pendingPresence: []
       };
       saveState();
-      switchAccount(id);
+      switchAccount(id, remember);
       if (window.confetti) confetti({ particleCount: 55, spread: 50, origin: { y: 0.65 } });
       showToast(`¡Cuenta ${clean}${tag} creada! Bienvenido a VaporEpico.`, 'success');
       return true;
     }
 
     function sendFriendRequest(targetId) {
+      AuthService.load();
       const me = getUser();
+      if (!me) return;
       const target = state.accounts[targetId];
       if (!target || target.id === me.id) return;
       if (me.friends.includes(targetId)) return;
@@ -1458,7 +1525,9 @@
     }
 
     function acceptFriendRequest(fromId) {
+      AuthService.load();
       const me = getUser();
+      if (!me) return;
       const from = state.accounts[fromId];
       if (!from) return;
       me.incomingRequests = me.incomingRequests.filter(id => id !== fromId);
@@ -1472,7 +1541,9 @@
     }
 
     function declineFriendRequest(fromId) {
+      AuthService.load();
       const me = getUser();
+      if (!me) return;
       const from = state.accounts[fromId];
       me.incomingRequests = me.incomingRequests.filter(id => id !== fromId);
       if (from) from.outgoingRequests = from.outgoingRequests.filter(id => id !== me.id);
@@ -1483,7 +1554,9 @@
     }
 
     function removeFriend(friendId) {
+      AuthService.load();
       const me = getUser();
+      if (!me) return;
       const fr = state.accounts[friendId];
       me.friends = me.friends.filter(id => id !== friendId);
       if (fr) fr.friends = fr.friends.filter(id => id !== me.id);
@@ -1504,6 +1577,7 @@
         other.outgoingRequests = (other.outgoingRequests || []).filter(id => id !== accountId);
         other.pendingPresence = (other.pendingPresence || []).filter(p => p.fromId !== accountId);
       });
+      AuthService.removeDeviceAccount(accountId);
       state.currentAccountId = null;
       saveState();
       showAuthGate('login');
@@ -1826,18 +1900,26 @@
         me.playingGameId = gameId;
         me.status = 'ingame';
 
-        // Queue Steam-style presence notification for all friends of this account
-        me.friends.forEach(fid => {
+        // Reload fresh accounts first so we have up-to-date friend list (e.g. if someone removed us)
+        AuthService.load();
+        const freshMe = getUser();
+        if (!freshMe) return;
+        Object.keys(freshMe.library).forEach(k => { freshMe.library[k].playing = false; });
+        if (freshMe.library[gameId]) freshMe.library[gameId].playing = true;
+        freshMe.playingGameId = gameId;
+        freshMe.status = 'ingame';
+
+        const eventId = Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+        freshMe.friends.forEach(fid => {
           const fr = state.accounts[fid];
           if (fr) {
             if (!fr.pendingPresence) fr.pendingPresence = [];
-            fr.pendingPresence = fr.pendingPresence.filter(p => p.fromId !== me.id);
-            fr.pendingPresence.push({ fromId: me.id, gameId });
+            fr.pendingPresence = fr.pendingPresence.filter(p => p.fromId !== freshMe.id);
+            fr.pendingPresence.push({ eventId, fromId: freshMe.id, gameId });
           }
         });
         saveState();
-        // Broadcast real-time play event to other open tabs so friends get the Steam notification immediately!
-        AuthService.broadcastPresence(me.id, gameId);
+        AuthService.broadcastPresence(freshMe.id, gameId, eventId);
         showToast(`Iniciando "${game.title}" · Tus amigos ahora ven que estás jugando.`, 'success');
       }
       updateHeaderBadges();
@@ -3663,69 +3745,127 @@
         showAuthGate('login', false);
       }
 
-      // Real-time cross-tab synchronization (friend requests, accepted friends, reviews, and live playing notifications!)
+      // Unified WhatsApp/Steam-style real-time sync across tabs (BroadcastChannel + storage + 1.2s poller)
+      function deliverPendingPresenceForMe() {
+        const me = getUser();
+        if (!me || !me.pendingPresence || me.pendingPresence.length === 0) return;
+        const queued = [...me.pendingPresence];
+        me.pendingPresence = [];
+        saveState();
+        queued.forEach(item => {
+          if (item.eventId && seenPresenceEventIds.has(item.eventId)) return;
+          if (item.eventId) seenPresenceEventIds.add(item.eventId);
+          if (item.fromId === me.id) return;
+          if (!me.friends.includes(item.fromId)) return;
+          const friendAcc = state.accounts[item.fromId];
+          const game = getGameById(item.gameId);
+          if (friendAcc && game) {
+            pushSteamPresenceNotification(friendAcc, game);
+          }
+        });
+      }
+
+      function syncFromSharedStorage(force = false) {
+        let raw = '';
+        try { raw = localStorage.getItem(STORAGE_KEY) || ''; } catch (e) { return; }
+        if (!force && raw === lastLocalStorageSnapshot) return;
+        lastLocalStorageSnapshot = raw;
+
+        const prevMe = getUser();
+        const prevReqIds = prevMe ? [...(prevMe.incomingRequests || [])] : [];
+        const prevFriendIds = prevMe ? [...(prevMe.friends || [])] : [];
+
+        AuthService.load();
+
+        if (!state.isAuthenticated) {
+          renderAuthGate();
+          return;
+        }
+
+        const me = getUser();
+        if (!me) {
+          showAuthGate('login', true);
+          return;
+        }
+
+        // 1. Live incoming friend requests
+        const newReqs = (me.incomingRequests || []).filter(id => !prevReqIds.includes(id));
+        newReqs.forEach(fromId => {
+          const sender = state.accounts[fromId];
+          if (sender) {
+            SoundEngine.playSteamChime(false);
+            showToast(`📩 ${sender.username} te envió una solicitud de amistad.`, 'success');
+          }
+        });
+
+        // 2. Live accepted friend requests
+        const newFriends = (me.friends || []).filter(id => !prevFriendIds.includes(id) && !prevReqIds.includes(id));
+        newFriends.forEach(fid => {
+          const fr = state.accounts[fid];
+          if (fr) showToast(`🤝 ${fr.username} aceptó tu solicitud de amistad.`, 'success');
+        });
+
+        // 3. Live friend removals (if someone removes you, they disappear immediately!)
+        const removedFriends = prevFriendIds.filter(id => !(me.friends || []).includes(id));
+        if (removedFriends.length > 0) {
+          updateHeaderBadges();
+          if (state.currentView === 'friends') renderMain();
+        }
+
+        // 4. Live Steam-style "Friend is now playing" notifications (pops up anywhere, anytime!)
+        deliverPendingPresenceForMe();
+
+        updateHeaderBadges();
+        // Re-render Friends or Catalog/Store cleanly without disrupting open text inputs
+        const activeEl = document.activeElement;
+        const isTyping = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA');
+        if (!isTyping && (state.currentView === 'friends' || removedFriends.length > 0 || newReqs.length > 0 || newFriends.length > 0)) {
+          renderMain();
+        }
+      }
+
+      function handleLivePresencePayload(ev) {
+        if (!ev || !ev.fromId || !state.isAuthenticated) return;
+        if (ev.eventId && seenPresenceEventIds.has(ev.eventId)) return;
+        AuthService.load();
+        const me = getUser();
+        if (!me || ev.fromId === me.id) return;
+        if (!me.friends.includes(ev.fromId)) return;
+        if (ev.eventId) seenPresenceEventIds.add(ev.eventId);
+
+        const friendAcc = state.accounts[ev.fromId];
+        const game = getGameById(ev.gameId);
+        if (friendAcc && game) {
+          if (me.pendingPresence && me.pendingPresence.length > 0) {
+            me.pendingPresence = me.pendingPresence.filter(p => p.fromId !== ev.fromId);
+            saveState();
+          }
+          pushSteamPresenceNotification(friendAcc, game);
+        }
+        updateHeaderBadges();
+        if (state.currentView === 'friends') renderMain();
+      }
+
       window.addEventListener('storage', (e) => {
         if (e.key === STORAGE_KEY) {
-          const prevMe = getUser();
-          const prevReqIds = prevMe ? [...(prevMe.incomingRequests || [])] : [];
-          const prevFriendIds = prevMe ? [...(prevMe.friends || [])] : [];
-
-          AuthService.load();
-
-          if (!state.isAuthenticated) {
-            renderAuthGate();
-            return;
-          }
-
-          const me = getUser();
-          if (!me) {
-            showAuthGate('login', true);
-            return;
-          }
-
-          // Detect new incoming friend requests in real time without reload!
-          const newReqs = (me.incomingRequests || []).filter(id => !prevReqIds.includes(id));
-          newReqs.forEach(fromId => {
-            const sender = state.accounts[fromId];
-            if (sender) {
-              SoundEngine.playSteamChime(false);
-              showToast(`📩 ${sender.username} te envió una solicitud de amistad.`, 'success');
-            }
-          });
-
-          // Detect newly accepted friend requests in real time!
-          const newFriends = (me.friends || []).filter(id => !prevFriendIds.includes(id) && !prevReqIds.includes(id));
-          newFriends.forEach(fid => {
-            const fr = state.accounts[fid];
-            if (fr) showToast(`🤝 ${fr.username} aceptó tu solicitud de amistad.`, 'success');
-          });
-
-          updateHeaderBadges();
-          renderMain();
+          syncFromSharedStorage(true);
         } else if (e.key === PRESENCE_EVENT_KEY && e.newValue) {
-          AuthService.load();
-          if (!state.isAuthenticated) return;
-          const me = getUser();
-          if (!me) return;
-          try {
-            const ev = JSON.parse(e.newValue);
-            if (ev && ev.fromId && ev.fromId !== me.id && me.friends.includes(ev.fromId)) {
-              const friendAcc = state.accounts[ev.fromId];
-              const game = getGameById(ev.gameId);
-              if (friendAcc && game) {
-                // Remove from pendingPresence so we don't notify twice
-                if (me.pendingPresence) {
-                  me.pendingPresence = me.pendingPresence.filter(p => p.fromId !== ev.fromId);
-                  saveState();
-                }
-                pushSteamPresenceNotification(friendAcc, game);
-              }
-            }
-            updateHeaderBadges();
-            if (state.currentView === 'friends') renderMain();
-          } catch (err) {}
+          try { handleLivePresencePayload(JSON.parse(e.newValue)); } catch (err) {}
         }
       });
+
+      if (liveChannel) {
+        liveChannel.onmessage = (msg) => {
+          if (!msg || !msg.data) return;
+          if (msg.data.type === 'presence') handleLivePresencePayload(msg.data.payload);
+          else if (msg.data.type === 'sync') syncFromSharedStorage(true);
+        };
+      }
+
+      // Lightweight 1.2s fallback poller so notifications & friend removals ALWAYS arrive live in any browser!
+      setInterval(() => {
+        if (state.isAuthenticated) syncFromSharedStorage(false);
+      }, 1200);
     });
   </script>
 </body>
